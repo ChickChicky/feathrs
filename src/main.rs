@@ -1,10 +1,5 @@
-#![allow(unused)]
-
 use std::{
-    thread::{
-        spawn,
-        Thread
-    },
+    thread,
     sync::{
         Arc,
         Mutex
@@ -13,147 +8,286 @@ use std::{
         TcpListener, 
         TcpStream
     },
-    process::{
-        exit
-    }
-};
-
-use console::{
-    Term,
-    Key::{ self,
-        Char,
-        UnknownEscSeq
-    }
+    ops::{Deref, DerefMut},
+    process::exit,
+    time,
+    io::{
+        stdout, 
+        Write
+    },
 };
 
 use ctrlc;
 
-fn handle_conn( ctx: Context, stream: TcpStream ) {
+use termlib::{
+    Term,
+    TermEvent
+};
+
+mod termlib;
+
+
+fn handle_conn( _ctx: Context, _stream: TcpStream ) {
 
 
 
 }
 
+fn sleep(ms:u64) {
+    thread::sleep(time::Duration::from_millis(ms));
+}
+
+trait IBuffer: Send + Sync {
+    /// Retrieves the text content of the buffer
+    fn get_text(&mut self) -> String;
+    /// Retreives a reference to the text content of the buffer
+    fn get_text_mut(&mut self) -> &mut String;
+    
+    /// Retreives the position of the cursor as (colum,row)
+    fn get_cursor_pos(&mut self) -> (i32,i32);
+    /// Retreives the position of the cursor as (colum,row) fixed
+    fn get_cursor_fix(&mut self) -> (i32,i32);
+    /// Retreives a reference to the cursor as (column,row)
+    fn get_cursor_mut(&mut self) -> &mut (i32,i32);
+    /*/// Sets the position of the cursor as (colum,row)
+    fn set_cursor_pos(&mut self, pos: (i32,i32));*/
+    /*/// Retreives the position of the cursor given the index of the cursor in the text
+    fn get_cursor_pos(&mut self, pos: i32) -> (i32,i32);*/
+    
+    /// Retreives the index of the cursor in the text
+    fn get_cursor_idx(&mut self) -> i32;
+    /// Sets the position of the cursor as its index in the text
+    fn set_cursor_idx(&mut self, pos: i32);
+    /*/// Retreives the index of the cursor in the text given the cursor as (column,row)
+    fn get_cursor_idx(&mut self, pos: (i32,i32)) -> i32;*/
+
+    fn clone_box(&mut self) -> Box<dyn IBuffer + Send + Sync>;
+}
+
+#[derive(Clone)]
+struct TextBuffer {
+    text: String,
+    cursor: (i32,i32),
+}
+
+impl IBuffer for TextBuffer {
+    fn get_cursor_pos(&mut self) -> (i32,i32) {
+        self.cursor.clone()
+    }
+    fn get_cursor_fix(&mut self) -> (i32,i32) {
+        (self.cursor.0,self.cursor.1.min(self.text.lines().nth(self.cursor.0 as usize).unwrap_or(&"").len() as i32))
+    }
+    fn get_cursor_idx(&mut self) -> i32 {
+        // TODO: Simplify this
+        (self.text.lines().collect::<Vec<&str>>()[..self.cursor.0.max(0) as usize].iter().fold(0,|acc,l|acc+l.len()+1)+self.text.lines().nth(self.cursor.0.max(0) as usize).unwrap_or(&"")[..self.cursor.1.max(0) as usize].len()) as i32
+    }
+    fn get_cursor_mut(&mut self) -> &mut (i32,i32) {
+        &mut self.cursor
+    }
+    fn get_text(&mut self) -> String {
+        self.text.clone()
+    }
+    fn get_text_mut(&mut self) -> &mut String {
+        &mut self.text
+    }
+    fn set_cursor_idx(&mut self, pos: i32) {
+        let prev: String = self.text[..pos as usize].to_string();
+        self.cursor = (prev.lines().fold(0,|acc:i32,_:&str|acc+1)-1,(prev.lines().last().unwrap_or(&"").len() as i32));
+    }
+    fn clone_box(&mut self) -> Box<dyn IBuffer + Send + Sync> {
+        Box::new(TextBuffer{
+            text: self.text.clone(),
+            cursor: self.cursor.clone()
+        })
+    }
+}
+
+impl TextBuffer {
+    pub fn new() -> Self {
+        Self {
+            text: String::new(),
+            cursor: (0,0),
+        }
+    }
+}
+
+// #[derive(Clone)]
+struct Buffer(Box<dyn IBuffer + Send + Sync + 'static>);
+
+impl Buffer {
+    pub fn new<T: IBuffer + Send + Sync + 'static>(buffer: T) -> Self {
+        Buffer(Box::from(buffer))
+    }
+}
+
+impl Deref for Buffer {
+    type Target = Box<dyn IBuffer + Sync + Send>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Buffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 #[derive(Clone)]
 struct Context {
-    //interface: Arc<Mutex<Vec<Panel>>>,
+    buffers: Arc<Mutex<Vec<Buffer>>>,
+    selected_buffer: usize,
 }
 
 impl Context {
     pub fn new() -> Self {
         Self {
-            // interface: Arc::new(Mutex::new(vec![]))
+            buffers: Arc::from(Mutex::from(vec![Buffer::new(TextBuffer::new())])),
+            selected_buffer: 0
         }
     }
-
-    /*pub fn get_interface(&self) -> Vec<Panel> {
-        return self.interface.lock().unwrap().clone();
+    
+    pub fn get_active_buffer(&self) -> Option<Buffer> {
+        let mut buffers = self.buffers.lock().unwrap();
+        if self.selected_buffer < buffers.len() {
+            Some(Buffer(buffers.get_mut(self.selected_buffer).unwrap().clone_box()))
+        } else { None }
     }
-    pub fn set_interface(&self, setter: Box<dyn Fn(&mut Vec<Panel>)->()>) {
-        setter(&mut *self.interface.lock().unwrap());
-    }*/
+
+    pub fn set_active_buffer(&self, setter: Box<dyn Fn(&mut Buffer)->()>) -> bool {
+        if let Some(buffer) = self.buffers.lock().unwrap().get_mut(self.selected_buffer) {
+            setter(buffer);
+            true
+        } else { false }
+    }
 }
 
 fn main() {
 
     ctrlc::set_handler(||{
-        print!("\x1b[?1003l");
+        print!("\x1b[?1003l\x1b[?1049l");
         exit(0);
-    });
+    }).unwrap();
 
-    let mut ctx: Context = Context::new();
-
-    /*ctx.set_interface(Box::new(|interfaces|{
-        interfaces.push(Panel::new());
-        interfaces.push(Panel::new());
-    }));*/
+    let ctx: Context = Context::new();
+    
+    let mut term: Term = Term::new();
+    term.enable_mouse();
+    term.enable_alternate_buffer();
+    term.init();
 
     // Language server thread
 
     let server_ctx: Context = ctx.clone();
-    spawn(move||{
-        let mut ctx: Context = server_ctx;
+    thread::spawn(move||{
+        let ctx: Context = server_ctx;
 
         let server: TcpListener = TcpListener::bind("0.0.0.0:1234").expect("Could not init language server.");
 
         for stream in server.incoming() {
             let listener_ctx = ctx.clone();
-            spawn(move||{ handle_conn(listener_ctx, stream.unwrap()); });
+            thread::spawn(move||{ handle_conn(listener_ctx, stream.unwrap()); });
+        }
+    });
+
+    // Render thread
+
+    let render_ctx: Context = ctx.clone();
+    let render_term: Term   = term.clone();
+    thread::spawn(move||{
+        let ctx: Context = render_ctx;
+        let _term: Term  = render_term;
+
+        loop { sleep(50);
+
+            if let Some(mut buffer) = ctx.get_active_buffer() {
+
+                let mut render_buff: String = String::new();
+
+                render_buff += "\x1b[H\x1b[J";
+
+                for line in buffer.get_text().lines().map(String::from).collect::<Vec<String>>() {
+                    render_buff += &(line + "\n");
+                }
+
+                render_buff += &format!("\x1b[{};{}H",buffer.get_cursor_fix().0+1,buffer.get_cursor_fix().1+1);
+
+                stdout().write_all(render_buff.as_bytes()).unwrap(); stdout().flush().unwrap();
+
+            }
+            
         }
     });
 
     // Input thread
 
     let input_ctx: Context = ctx.clone();
-    spawn(move||{
+    let input_term: Term   = term.clone();
+    thread::spawn(move||{
+        let ctx: Context = input_ctx;
+        let mut term: Term   = input_term;
 
-        let mut ctx: Context = input_ctx;
+        loop { sleep(10);
 
-        let term: Term = Term::stdout();
+            while let Some(event) = term.consume_event() {
 
-        let mut buf_escseq: String = String::new();
+                match event {
+                    TermEvent::Char{char} => {
+                        ctx.set_active_buffer(Box::new(move|buffer: &mut Buffer|{
+                            let ci: usize = buffer.get_cursor_idx() as usize;
+                            buffer.get_text_mut().insert(ci,char);
+                            buffer.get_cursor_mut().1 += 1;
+                        }));
+                    },
+                    /*TermEvent::Mouse{event} => {
 
-        fn handle_mouse(v:String) {
-            let parts: Vec<u32> = v[1..].split(";").map(|v|v.parse::<u32>().unwrap()).collect::<Vec<u32>>();
-            if parts.len() == 3 {
-                let ev: u32 = parts[0]; let ev_type: u32 = (ev>>5)&2;
-                // Modifiers:
-                //  1 : alt
-                //  2 : ctrl
-                // Button states:
-                //  0 : left click
-                //  1 : middle-click
-                //  2 : right click
-                //  3 : none
-                if ev_type == 0 { // ???
-
-                } else if ev_type == 1 { // Click
-                    let button_state: u32 = ev&2;
-                    let modifier: u32 = (ev>>3)&2;
-                } else if ev_type == 2 { // Move
-                    let button_state: u32 = ev&2;
-                    let modifier: u32 = (ev>>3)&2;
-                } else if ev_type == 3 { // Scroll
-                    let dir: u32 = ev&1; // 0 -> up / 1 -> down
-                }
-            }
-            println!("MOUSE EV `{:032b}`",parts[0]);
-        }
-
-        println!("\x1b[?1003h\x1b[?1015h");
-
-        'input_loop: loop {
-
-            if let Ok(key) = term.read_key() {
-                match key {
-                    Char(x) => {
-                        if buf_escseq.len() > 0 {
-                            if x == 'M' {
-                                handle_mouse(buf_escseq.clone());
-                                buf_escseq.clear();
-                            } else {
-                                buf_escseq.push(x);
+                    },*/
+                    TermEvent::Arrow{x, y, modifiers: _} => {
+                        ctx.set_active_buffer(Box::new(move|buffer: &mut Buffer|{
+                            let text = buffer.get_text();
+                            let cursor: &mut (i32,i32) = buffer.get_cursor_mut();
+                            let lines: Vec<&str> = text.lines().collect::<Vec<&str>>();
+                            cursor.0 = (cursor.0+y).max(0).min(lines.len() as i32-1);
+                            cursor.1 = cursor.1+x;
+                            if x != 0 {
+                                if cursor.1 < 0 {
+                                    cursor.1 = if cursor.0 > 0 { lines.get((cursor.0-1).max(0) as usize).unwrap_or(&"").len() as i32 } else { 0 };
+                                    cursor.0 = (cursor.0-1).max(0);
+                                }
+                                else if cursor.1 > lines.get(cursor.0 as usize).unwrap_or(&"").len() as i32 {
+                                    if cursor.0+1 < lines.len() as i32 {
+                                        cursor.1 = 0;
+                                        cursor.0 = (cursor.0+1).min(lines.len() as i32);
+                                    } else {
+                                        cursor.1 = lines.get(cursor.0 as usize).unwrap_or(&"").len() as i32;
+                                    }
+                                }
+                                cursor.1 = cursor.1.min(lines.get(cursor.0 as usize).unwrap_or(&"").len() as i32);
                             }
-                        } else {
-                            println!("KEY {}",x);
-                        }
+                        }));
                     },
-
-                    UnknownEscSeq(chars) => {
-                        let seq = String::from_utf8(chars.iter().map(|v|*v as u8).collect()).unwrap();
-                        if seq[1..].parse::<u32>().is_ok() {
-                            buf_escseq = seq;
-                        } else {
-                            println!("ESCSEQ {:?}",seq);
-                        }
+                    TermEvent::Enter{} => {
+                        ctx.set_active_buffer(Box::new(move|buffer: &mut Buffer|{
+                            let ci: usize = buffer.get_cursor_idx() as usize;
+                            buffer.get_text_mut().insert(ci,'\n');
+                            let cursor = buffer.get_cursor_mut();
+                            cursor.0 += 1;
+                            cursor.1 = 0;
+                        }));
                     },
-
-                    _ => {
-                        println!("Unknown {:?}",key);
-                    }
+                    TermEvent::Backspace{} => {
+                        ctx.set_active_buffer(Box::new(move|buffer: &mut Buffer|{
+                            let i = buffer.get_cursor_idx();
+                            if i != 0 {
+                                buffer.get_text_mut().remove(i as usize-1);
+                                buffer.set_cursor_idx(i as i32-1);
+                            }
+                        }));
+                    },
+                    _ => {},
                 };
-            } else {
-                break 'input_loop;
+    
             }
 
         }
