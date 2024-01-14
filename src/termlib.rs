@@ -234,26 +234,26 @@ impl Term {
     }
 
     pub fn enable_mouse(&mut self) {
-        let mut flags = self.flags.lock().unwrap();
         print!("\x1b[?1003h\x1b[?1015h"); stdout().flush().unwrap();
+        let mut flags = self.flags.lock().unwrap();
         *flags |= 1;
     }
 
     pub fn disable_mouse(&mut self) {
-        let mut flags = self.flags.lock().unwrap();
         print!("\x1b[?1015l\x1b[?1003l"); stdout().flush().unwrap();
+        let mut flags = self.flags.lock().unwrap();
         *flags &= !1;
     }
 
     pub fn enable_alternate_buffer(&mut self) {
-        let mut flags = self.flags.lock().unwrap();
         print!("\x1b[?1049h"); stdout().flush().unwrap();
+        let mut flags = self.flags.lock().unwrap();
         *flags |= 2;
     }
 
     pub fn disable_alternate_buffer(&mut self) {
-        let mut flags = self.flags.lock().unwrap();
         print!("\x1b[?1049l"); stdout().flush().unwrap();
+        let mut flags = self.flags.lock().unwrap();
         *flags &= !2;
     }
 
