@@ -8,4 +8,5 @@ edition = "2021"
 [dependencies]
 console = "0.15.7"
 ctrlc = "3.4.1"
+termsize = "0.1.6"
 
