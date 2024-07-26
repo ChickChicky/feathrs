@@ -1,0 +1,470 @@
+#![allow(unused_mut,dead_code)]
+
+use std::{collections::VecDeque, env::args, fs, io::{stdin, stdout, Write}, sync::{Arc, Mutex}, thread::{sleep, spawn}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+
+use libc::{self, termios};
+use renderer::{Color, Renderer, Style};
+use termion::{event::{Event, Key}, input::TermReadEventsAndRaw};
+
+mod renderer;
+
+const BACKGROUND : Color = Color::RGB(40, 42, 54);
+const HEAD : Color = Color::RGB(68, 71, 90);
+const CURRENT : Color = Color::RGB(50, 52, 64);
+const FOREGROUND : Color = Color::RGB(248, 248, 242);
+const COMMENT : Color = Color::RGB(98, 114, 164);
+const RED : Color = Color::RGB(255, 85, 85);
+const YELLOW : Color = Color::RGB(241, 250, 140);
+
+struct Clock {
+    next: Instant,
+    delay: Duration,
+}
+
+impl Clock {
+    fn new(delay: Duration) -> Self {
+        Self {
+            delay,
+            next: Instant::now() + delay
+        }
+    }
+    fn tick(&mut self) -> bool {
+        let now = Instant::now();
+        if now >= self.next {
+            self.next = now + self.delay;
+            return true;
+        }
+        return false;
+    }
+}
+
+trait Window {
+    fn render(&mut self, env: &mut Env, renderer: &mut Renderer) -> ();
+    fn key_pressed(&mut self, env: &mut Env, ev: Event) -> ();
+}
+
+struct Buffer {
+    body: String,
+    cursor: (i32, i32),
+    scroll: (i32, i32),
+    menu: Option<String>
+}
+
+impl Buffer {
+    fn new() -> Self {
+        Self {
+            body: String::new(),
+            cursor: (0, 0),
+            scroll: (0, 0),
+            menu: None,
+        }
+    }
+
+    fn from_file(path: String) -> Self {
+        Self {
+            body: fs::read_to_string(path).unwrap(),
+            cursor: (0, 0),
+            scroll: (0, 0),
+            menu: None,
+        }
+    }
+
+    fn cur(&self, c: (i32, i32)) -> usize {
+        if self.body.len() == 0 {
+            return 0
+        }
+
+        let lines = self.body.split('\n').collect::<Vec<&str>>();
+        
+        let cy = (c.1.max(0) as usize).min(lines.len()-1);
+
+        let mut j = 0usize;
+
+        for y in 0..lines.len() {
+            let l = lines[y].len() + 1;
+            if cy == y {
+                let cx = (c.0.max(0) as usize).min(l-1);
+                return j + cx;
+            }
+            j += l;
+        }
+
+        return self.body.len();
+    }
+
+    fn fix(&self, c: (i32, i32)) -> (i32, i32) {
+        let lines = self.body.split('\n').collect::<Vec<&str>>();
+        
+        let cy = (c.1.max(0) as usize).min(lines.len()-1) as i32;
+        let cx = (c.0.max(0) as usize).min(lines[cy as usize].len()) as i32;
+
+        return (cx, cy);
+    }
+
+    fn ipos(&self, i: usize) -> (i32,i32) {
+        if self.body.len() == 0 {
+            return (0, 0)
+        }
+
+        let lines = self.body.split('\n').collect::<Vec<&str>>();
+
+        let mut j = 0usize;
+
+        for y in 0..lines.len() {
+            let nj = j + lines[y].len() + 1;
+            if i >= j && i < nj {
+                return ((i-j) as i32, y as i32)
+            }
+            j = nj;
+        }
+
+        return (lines.last().unwrap().len() as i32, (lines.len()-1) as i32);
+    }
+}
+
+impl Window for Buffer {
+    fn render(&mut self, _env: &mut Env, renderer: &mut Renderer) {
+        renderer.clear();
+
+        let w = renderer.buffer.width;
+        let h = renderer.buffer.height;
+
+        let tw = w - 5u32;
+        let th = h - 2u32;
+
+        let cursor: Option<(i32,i32)> = 
+            if let Some(t) = &self.menu {
+                renderer.put_text(0, h-1, t.to_string());
+                Some((t.len() as i32, h as i32 - 1))
+            }
+            else {
+                None
+            }
+        ;
+
+        renderer.paint(0, 0, w as u32, 1, Style::default().fg(FOREGROUND).bg(HEAD).clone());
+        renderer.paint(0, h as u32 -1, w as u32, 1, Style::default().fg(FOREGROUND).bg(HEAD).clone());
+        renderer.paint(0, 1, 4, th, Style::default().bg(COMMENT).clone());
+        renderer.paint(5, 1, tw, th, Style::default().bg(BACKGROUND).fg(FOREGROUND).clone());
+
+        let body = self.body.clone();
+        let lines = body.split('\n').collect::<Vec<&str>>();
+
+        let cur = self.fix(self.cursor);
+        let (cx, cy) = (cur.0 - self.scroll.0, cur.1 - self.scroll.1);
+
+        if cy >= 0 && (cy as u32) <= th {
+            renderer.paint(5, (cy+1) as u32, (w-5) as u32, 1, Style::default().fg(FOREGROUND).bg(CURRENT).clone());
+            renderer.paint(0, (cy+1) as u32, 4, 1, Style::default().fg(COMMENT).bg(FOREGROUND).clone());
+        }
+
+        let mut bi = 0;
+
+        for y in 0 .. th {
+            renderer.put_text(3, y+1, "~".to_string());
+        }
+
+        for j in 0 .. th {
+            let ii = j as i32 + self.scroll.1;
+            if ii < 0 || ii > (th as i32) {
+                continue
+            }
+            let i = ii as u32;
+            // if let Some(line) = lines.get((i as i32+self.scroll.) as usize) {
+            if let Some(line) = lines.get(i as usize) {
+                renderer.put_text(0, j+1, {let s = format!("{: >4}",i+1); s[s.len()-4..s.len()].to_string()});
+                for l in 0usize .. line.len() {
+                    let x = l as i32  -self.scroll.0;
+                    if x > 0 {
+                        if x as u32 >= tw { 
+                            break;
+                        }
+                        renderer.get_mut(x as u32+5, j+1).c = line.as_bytes()[l] as char;
+                    }
+                }
+                renderer.put_text(5, j+1, line[(self.scroll.0 as usize).min(line.len())..line.len().min(tw as usize)].to_string());
+                let nbi = bi + line.len() + 1;
+                bi = nbi;
+            }
+        }
+
+        if self.menu == None && cx >= 0 && (cx as u32) < tw && cy >= 0 && (cy as u32) <= th {
+            renderer.get_mut((cx+5) as u32, (cy+1) as u32).s.reverse(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()%1000 < 500);
+        }
+
+        /*renderer.put(&TextOptions{
+            pos: (5,1),
+            offset: None,
+            text: body.clone(),
+            max_w: Some((w-5) as i32),
+            max_h: Some((h-2) as i32),
+            wrap: Some(false),
+            style: None
+        });*/
+
+        renderer.apply(5, 1, tw, th, &|cell, _x, _y| {
+            if cell.c < '\x20' {
+                cell.c = char::from_u32((cell.c as u32) + 0x2400u32).unwrap();
+                cell.s = cell.s.clone().bg(RED).clone();
+            }
+        });
+
+        print!("\x1b[{};1H",h);
+        if let Some((x,y)) = cursor {
+            print!("\x1b[?25h\x1b[{};{}H",y+1,x+1);
+        } else {
+            print!("\x1b[?25l");
+        }
+
+        renderer.render();
+        renderer.flip();
+        stdout().flush().unwrap();
+    }
+
+    fn key_pressed(&mut self, env: &mut Env, ev: Event) {
+        if let Some(menu) = &mut self.menu {
+            match ev {
+                Event::Key(key) => {
+                    match key {
+                        Key::Esc => {
+                            self.menu = None;
+                        }
+                        Key::Char(c) => {
+                            if menu.is_empty() {
+                                if c == ':' {
+                                    *menu += ":";
+                                }
+                            }
+                            else if menu.starts_with(':') {
+                                if !c.is_control() {
+                                    menu.push(c);
+                                }
+                                else if c == '\n' {
+                                    // TODO: Run the action
+                                    self.menu = None;
+                                }
+                            }
+                            else {
+                                self.menu = None;
+                                // unreachable!("Invalid menu state");
+                            }
+                        }
+                        Key::Backspace => { // TODO: Move the if's higher
+                            if menu.starts_with(':') {
+                                if menu.len() > 1 {
+                                    menu.pop();
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            match ev {
+                Event::Key(key) => {
+                    // println!("{:?}",key);
+                    match key {
+                        Key::Esc => {
+                            self.menu = Some(String::new());
+                        }
+                        Key::Char(c) => {
+                            let ci = self.cur(self.fix(self.cursor));
+                            if c == '\x09' {
+                                self.body.insert_str(ci, "    ");
+                                self.cursor = self.ipos(ci+4);
+                            } else if c == '\r' {
+                                self.body.insert(ci, '\n');
+                                self.cursor = self.ipos(ci+1);
+                            } else {
+                                self.body.insert(ci, c);
+                                self.cursor = self.ipos(ci+1);
+                            }
+                        }
+                        Key::Backspace => {
+                            let ci = self.cur(self.fix(self.cursor));
+                            self.body.pop();
+                            if ci != 0 {
+                                self.cursor = self.ipos(ci-1);
+                            }
+                        }
+                        Key::Ctrl(c) => {
+                            if c == 'c' {
+                                env.running = false;
+                            }
+                        }
+                        Key::Alt(_c) => {
+                            // ?
+                        }
+                        Key::Up => {
+                            self.cursor.1 -= 1;
+                            if self.cursor.1 < 0 {
+                                self.cursor = (0,0);
+                            }
+                        }
+                        Key::Down => {
+                            let lines = self.body.split('\n').collect::<Vec<&str>>();
+                            self.cursor.1 += 1;
+                            if self.cursor.1 as usize >= lines.len() {
+                                self.cursor = ((lines.len()-1) as i32,lines.last().unwrap().len() as i32);
+                            }
+                        }
+                        Key::Left => {
+                            let ci = self.cur(self.fix(self.cursor));
+                            if ci != 0 {
+                                self.cursor = self.ipos(ci-1);
+                            }
+                        }
+                        Key::Right => {
+                            self.cursor = self.ipos(self.cur(self.fix(self.cursor))+1)
+                        }
+                        Key::CtrlUp => {
+                            if self.scroll.1 > 0 {
+                                self.scroll.1 -= 1;
+                            }
+                        }
+                        Key::CtrlDown => {
+                            let lines = self.body.split('\n').collect::<Vec<&str>>();
+                            if (self.scroll.1 as usize) +1 < lines.len() {
+                                self.scroll.1 += 1;
+                            }
+                        }
+                        Key::CtrlLeft => {
+                            if self.scroll.0 > 0 {
+                                self.scroll.0 -= 1;
+                            }
+                        }
+                        Key::CtrlRight => {
+                            let maxlen = self.body.split('\n').map(|l|l.len()).max().unwrap();
+                            if (self.scroll.0 as usize) +1 < maxlen {
+                                self.scroll.0 += 1;
+                            }
+                        }
+                        _ => {
+                            let ci = self.cur(self.fix(self.cursor));
+                            let s = format!("{:?}",key);
+                            self.body.insert_str(ci, s.as_str());
+                            self.cursor = self.ipos(ci+s.len());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+struct Windows {
+    windows: Vec<Box<dyn Window>>,
+    current: usize,
+}
+
+impl Windows {
+    fn new() -> Self {
+        Self {
+            windows: vec![],
+            current: usize::MAX,
+        }
+    }
+
+    fn push(&mut self, win: Box<dyn Window>, focus: bool) {
+        self.windows.push(win);
+        if focus {
+            self.current = self.windows.len() -1usize;
+        }
+    }
+
+    fn focused(&mut self) -> &mut Box<dyn Window> {
+        return &mut self.windows[self.current];
+    }
+}
+
+struct Env {
+    windows: Windows,
+    running: bool,
+}
+
+fn raw_stdin() -> termios {
+    let mut termios = core::mem::MaybeUninit::uninit();
+    unsafe { libc::tcgetattr(libc::STDIN_FILENO, termios.as_mut_ptr()); }
+    let mut termios = unsafe { termios.assume_init() };
+    let v =  termios.clone();
+    termios.c_lflag &= !(libc::IGNBRK | libc::ICANON | libc::ECHO);
+    unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &termios); }
+    return v;
+}
+
+fn unraw_stdin(original: termios) {
+    unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &original); }
+}
+
+fn main() {
+    print!("\x1b[?1049h");
+    let original_termios = raw_stdin();
+
+    let mut renderer = Renderer::new();
+
+    let mut render_clk = Clock::new(Duration::from_millis(16));
+
+    let mut events = Arc::new(Mutex::new(VecDeque::<(Event,Vec<u8>)>::new()));
+    let mut tevents = events.clone();
+
+    let mut args = args();
+
+    let _program = args.next().unwrap();
+    let filename = args.next();
+
+
+    /*let mut body = String::new();
+
+    for c in '\x00'..'\x21' {
+        body.push(c);
+    }*/
+
+    // Kind of annoying, but stdin reads are blocking,
+    // so they need to be done in a dedicated thread
+    spawn(move||{
+        for e in stdin().events_and_raw() {
+            tevents.lock().unwrap().push_front(e.unwrap());
+        }
+    });
+
+    let mut env = Env{
+        windows: Windows::new(),
+        running: true,
+    };
+
+    env.windows.push(
+        Box::new(
+            if let Some(filename) = filename {
+                Buffer::from_file(filename)
+            }
+            else {
+                Buffer::new()
+            }
+        ), 
+        true
+    );
+
+    while env.running {
+        sleep(Duration::from_millis(1));
+
+        // Process Events
+        while let Some(event) = events.lock().unwrap().pop_back() {
+            let (ev, _keys) = event;
+            let e = (&mut env) as *mut Env;
+            unsafe { env.windows.focused().key_pressed(&mut *e, ev); }
+        }
+
+        if render_clk.tick() {
+            let e = (&mut env) as *mut Env;
+            unsafe { env.windows.focused().render(&mut *e, &mut renderer); }
+        }
+
+    }
+
+    print!("\x1b[?1049l\x1b[?25h");
+    stdout().flush().unwrap();
+    unraw_stdin(original_termios);
+}
