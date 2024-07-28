@@ -1,6 +1,7 @@
 #![allow(unused_mut,dead_code)]
 
-use std::{collections::VecDeque, env::args, fs, io::{stdin, stdout, Write}, sync::{Arc, Mutex}, thread::{sleep, spawn}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+use core::panic;
+use std::{collections::VecDeque, env::args, fs, io::{stdin, stdout, Write}, sync::{Arc, Mutex}, thread::{sleep, spawn}, time::{Duration, Instant}};
 
 use libc::{self, termios};
 use renderer::{Color, Renderer, Style};
@@ -15,6 +16,8 @@ const FOREGROUND : Color = Color::RGB(248, 248, 242);
 const COMMENT : Color = Color::RGB(98, 114, 164);
 const RED : Color = Color::RGB(255, 85, 85);
 const YELLOW : Color = Color::RGB(241, 250, 140);
+
+const BLINK_HOLD : Duration = Duration::from_millis(200);
 
 struct Clock {
     next: Instant,
@@ -43,11 +46,26 @@ trait Window {
     fn key_pressed(&mut self, env: &mut Env, ev: Event) -> ();
 }
 
+#[derive(Clone)]
+enum BufferMenuState {
+    None,
+    Open(String),
+    Command(String),
+    SaveFailed(u8,String)
+}
+
+impl BufferMenuState {
+    
+}
+
 struct Buffer {
     body: String,
     cursor: (i32, i32),
     scroll: (i32, i32),
-    menu: Option<String>
+    menu: Option<BufferMenuState>,
+    saved: bool,
+    path: Option<String>,
+    hold_blink: Instant,
 }
 
 impl Buffer {
@@ -57,15 +75,22 @@ impl Buffer {
             cursor: (0, 0),
             scroll: (0, 0),
             menu: None,
+            saved: false,
+            path: None,
+            hold_blink: Instant::now(),
         }
     }
 
-    fn from_file(path: String) -> Self {
+    fn from_file(path: &String) -> Self {
+        let body = fs::read_to_string(path);
         Self {
-            body: fs::read_to_string(path).unwrap(),
+            saved: body.is_ok(),
+            body: body.unwrap_or(String::new()),
             cursor: (0, 0),
             scroll: (0, 0),
             menu: None,
+            path: Some(path.clone()),
+            hold_blink: Instant::now(),
         }
     }
 
@@ -120,6 +145,22 @@ impl Buffer {
 
         return (lines.last().unwrap().len() as i32, (lines.len()-1) as i32);
     }
+
+    pub fn write(&mut self) -> bool {
+        if let Some(path) = self.path.clone() {
+            fs::write(path, self.body.clone()).and_then(|_r|Ok(self.saved=true)).is_ok()
+        } else {
+            false
+        }
+    }
+
+    pub fn read(&mut self) -> bool {
+        if let Some(path) = self.path.clone() {
+            fs::read_to_string(path).and_then(|_r|Ok(self.saved=true)).is_ok()
+        } else {
+            false
+        }
+    }
 }
 
 impl Window for Buffer {
@@ -132,26 +173,60 @@ impl Window for Buffer {
         let tw = w - 5u32;
         let th = h - 2u32;
 
-        let cursor: Option<(i32,i32)> = 
-            if let Some(t) = &self.menu {
-                renderer.put_text(0, h-1, t.to_string());
-                Some((t.len() as i32, h as i32 - 1))
+        let cur = self.fix(self.cursor);
+        let (cx, cy) = (cur.0 - self.scroll.0, cur.1 - self.scroll.1);
+        
+        renderer.paint(0, h as u32 -1, w as u32, 1, Style::default().fg(FOREGROUND).bg(HEAD).clone());
+        renderer.paint(5, 1, tw, th, Style::default().bg(BACKGROUND).fg(FOREGROUND).clone());
+
+        let cursor: Option<(i32,i32)> =
+            if let Some(menu) = &self.menu {
+                match menu {
+                    BufferMenuState::None => {
+                        Some((0i32, h as i32 -1))
+                    },
+                    BufferMenuState::Open(message) => {
+                        renderer.put_text(w-1-(message.len() as u32), h-1, message.clone());
+                        renderer.get_mut(0, h-1).c = '>';
+                        // renderer.get_mut(0, h-1).s.fg(BACKGROUND).bg(YELLOW);
+                        Some((1 as i32, h as i32 - 1))
+                    }
+                    BufferMenuState::Command(cmd) => {
+                        let r = format!(":{}",cmd);
+                        renderer.put_text(0, h-1, r.clone());
+                        // renderer.get_mut(0, h-1).s.fg(BACKGROUND).bg(YELLOW);
+                        Some(((r.len()) as i32, h as i32 - 1))
+                    }
+                    BufferMenuState::SaveFailed(_id,message) => {
+                        let r = format!("!{}",message);
+                        renderer.put_text(0, h-1, r.clone());
+                        renderer.get_mut(0, h-1).s.fg(BACKGROUND).bg(RED);
+                        Some(((r.len()) as i32, h as i32 - 1))
+                    }
+                }
             }
             else {
+                let fmt = format!("{}:{}",cy+1,cx+1);
+                renderer.put_text(w-1-(fmt.len() as u32), h-1, fmt);
                 None
             }
         ;
 
-        renderer.paint(0, 0, w as u32, 1, Style::default().fg(FOREGROUND).bg(HEAD).clone());
-        renderer.paint(0, h as u32 -1, w as u32, 1, Style::default().fg(FOREGROUND).bg(HEAD).clone());
+        // renderer.paint(0, 1, 4, th, Style::default().bg(if cursor.is_none() {COMMENT} else {HEAD}).clone());
         renderer.paint(0, 1, 4, th, Style::default().bg(COMMENT).clone());
-        renderer.paint(5, 1, tw, th, Style::default().bg(BACKGROUND).fg(FOREGROUND).clone());
+
+        {
+            renderer.paint(0, 0, w as u32, 1, Style::default().fg(FOREGROUND).bg(HEAD).clone());
+            let path = self.path.clone().unwrap_or("<new>".to_string());
+            let off = w/2-(path.len() as u32)/2;
+            renderer.put_text(off, 0, path);
+            if !self.saved {
+                renderer.put_text(w-1, 0, "M".to_string());
+            }
+        }
 
         let body = self.body.clone();
         let lines = body.split('\n').collect::<Vec<&str>>();
-
-        let cur = self.fix(self.cursor);
-        let (cx, cy) = (cur.0 - self.scroll.0, cur.1 - self.scroll.1);
 
         if cy >= 0 && (cy as u32) <= th {
             renderer.paint(5, (cy+1) as u32, (w-5) as u32, 1, Style::default().fg(FOREGROUND).bg(CURRENT).clone());
@@ -174,7 +249,7 @@ impl Window for Buffer {
             if let Some(line) = lines.get(i as usize) {
                 renderer.put_text(0, j+1, {let s = format!("{: >4}",i+1); s[s.len()-4..s.len()].to_string()});
                 for l in 0usize .. line.len() {
-                    let x = l as i32  -self.scroll.0;
+                    let x = l as i32 -self.scroll.0;
                     if x > 0 {
                         if x as u32 >= tw { 
                             break;
@@ -188,8 +263,8 @@ impl Window for Buffer {
             }
         }
 
-        if self.menu == None && cx >= 0 && (cx as u32) < tw && cy >= 0 && (cy as u32) <= th {
-            renderer.get_mut((cx+5) as u32, (cy+1) as u32).s.reverse(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()%1000 < 500);
+        if self.menu.is_none() && cx >= 0 && (cx as u32) < tw && cy >= 0 && (cy as u32) <= th {
+            renderer.get_mut((cx+5) as u32, (cy+1) as u32).s.reverse(Instant::now()<self.hold_blink||Instant::now().duration_since(self.hold_blink).as_millis()%1000 < 500);
         }
 
         /*renderer.put(&TextOptions{
@@ -223,37 +298,72 @@ impl Window for Buffer {
 
     fn key_pressed(&mut self, env: &mut Env, ev: Event) {
         if let Some(menu) = &mut self.menu {
+            let mut new_menu = menu.clone();
             match ev {
                 Event::Key(key) => {
                     match key {
                         Key::Esc => {
-                            self.menu = None;
+                            new_menu = BufferMenuState::None;
                         }
                         Key::Char(c) => {
-                            if menu.is_empty() {
-                                if c == ':' {
-                                    *menu += ":";
+                            match menu {
+                                BufferMenuState::None => {
+                                    // Not supposed to happen?
+                                    panic!("Invalid menu state");
                                 }
-                            }
-                            else if menu.starts_with(':') {
-                                if !c.is_control() {
-                                    menu.push(c);
+                                BufferMenuState::Open(_message) => {
+                                    if c == ':' {
+                                        new_menu = BufferMenuState::Command(String::new());
+                                    }
+                                    else if c == 'w' {
+                                        if self.write() {
+                                            new_menu = BufferMenuState::Open(format!("Wrote {} bytes",self.body.len()));
+                                        } else {
+                                            new_menu = BufferMenuState::Open("Could not write".to_string());
+                                        }
+                                    }
+                                    else if c == 'q' {
+                                        if self.saved {
+                                            env.running = false;
+                                        } else {
+                                            new_menu = BufferMenuState::SaveFailed(0, "File not saved, continue?".to_string());
+                                        }
+                                    }
                                 }
-                                else if c == '\n' {
-                                    // TODO: Run the action
-                                    self.menu = None;
+                                BufferMenuState::Command(cmd) => {
+                                    if !c.is_control() {
+                                        cmd.push(c);
+                                        new_menu = menu.clone();
+                                    }
+                                    else if c == '\n' {
+                                        // TODO: Run the action
+                                        new_menu = BufferMenuState::None;
+                                    }
                                 }
-                            }
-                            else {
-                                self.menu = None;
-                                // unreachable!("Invalid menu state");
+                                BufferMenuState::SaveFailed(id, _message) => {
+                                    if *id == 0 {
+                                        if c == 'y' || c == 'Y' {
+                                            env.running = false;
+                                        }
+                                        else if c == 'n' || c == 'N' {
+                                            new_menu = BufferMenuState::None;
+                                        }
+                                    }
+                                    else {
+                                        panic!("Invalid manu state");
+                                    }
+                                }
                             }
                         }
-                        Key::Backspace => { // TODO: Move the if's higher
-                            if menu.starts_with(':') {
-                                if menu.len() > 1 {
-                                    menu.pop();
+                        Key::Backspace => {
+                            match menu {
+                                BufferMenuState::Command(cmd) => {
+                                    if cmd.len() > 0 {
+                                        cmd.pop();
+                                    }
+                                    new_menu = menu.clone();
                                 }
+                                _ => {} 
                             }
                         }
                         _ => {}
@@ -261,13 +371,18 @@ impl Window for Buffer {
                 }
                 _ => {}
             }
+            self.menu = match new_menu {
+                BufferMenuState::None => None,
+                menu => Some(menu)
+            };
         } else {
             match ev {
                 Event::Key(key) => {
                     // println!("{:?}",key);
+                    let mut blink = false;
                     match key {
                         Key::Esc => {
-                            self.menu = Some(String::new());
+                            self.menu = Some(BufferMenuState::Open("".to_string()));
                         }
                         Key::Char(c) => {
                             let ci = self.cur(self.fix(self.cursor));
@@ -281,12 +396,14 @@ impl Window for Buffer {
                                 self.body.insert(ci, c);
                                 self.cursor = self.ipos(ci+1);
                             }
+                            self.saved = false;
                         }
                         Key::Backspace => {
                             let ci = self.cur(self.fix(self.cursor));
-                            self.body.pop();
-                            if ci != 0 {
+                            if ci > 0 {
+                                self.body.remove(ci-1);
                                 self.cursor = self.ipos(ci-1);
+                                self.saved = false;
                             }
                         }
                         Key::Ctrl(c) => {
@@ -341,12 +458,22 @@ impl Window for Buffer {
                                 self.scroll.0 += 1;
                             }
                         }
+                        Key::End => {
+                            self.cursor.0 = self.body.split('\n').nth(self.cursor.1 as usize).unwrap().len() as i32;
+                        }
+                        Key::Home => {
+                            self.cursor.0 = 0;
+                        }
                         _ => {
                             let ci = self.cur(self.fix(self.cursor));
                             let s = format!("{:?}",key);
                             self.body.insert_str(ci, s.as_str());
                             self.cursor = self.ipos(ci+s.len());
+                            blink = true;
                         }
+                    }
+                    if !blink {
+                        self.hold_blink = Instant::now() + BLINK_HOLD;
                     }
                 }
                 _ => {}
@@ -415,7 +542,6 @@ fn main() {
     let _program = args.next().unwrap();
     let filename = args.next();
 
-
     /*let mut body = String::new();
 
     for c in '\x00'..'\x21' {
@@ -438,7 +564,7 @@ fn main() {
     env.windows.push(
         Box::new(
             if let Some(filename) = filename {
-                Buffer::from_file(filename)
+                Buffer::from_file(&filename)
             }
             else {
                 Buffer::new()
