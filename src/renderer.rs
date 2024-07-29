@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::io::{stdout, Write};
-use term_size::dimensions;
+use terminal_size::{terminal_size,Width,Height};
 use macon::Builder;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -237,9 +237,9 @@ pub struct Buff {
 
 impl Buff {
     pub fn empty() -> Buff {
-        let (w,h) = dimensions().unwrap();
+        let (Width(w),Height(h)) = terminal_size().unwrap();
         Buff {
-            cells: vec![Cell::empty(); w * h],
+            cells: vec![Cell::empty(); w as usize * h as usize],
             width: w as u32,
             height: h as u32,
         }
