@@ -1,7 +1,7 @@
 #![allow(unused_mut,dead_code)]
 
 use core::panic;
-use std::{collections::VecDeque, env::args, fs, io::{stdin, stdout, Write}, sync::{Arc, Mutex}, thread::{sleep, spawn}, time::{Duration, Instant}};
+use std::{collections::VecDeque, env::{args, current_dir}, fs, io::{stdin, stdout, Write}, path::{self, Path}, sync::{Arc, Mutex}, thread::{sleep, spawn}, time::{Duration, Instant}};
 
 use libc::{self, termios};
 use renderer::{Color, Renderer, Style};
@@ -51,7 +51,9 @@ enum BufferMenuState {
     None,
     Open(String),
     Command(String),
-    SaveFailed(u8,String)
+    SaveFailed,
+    Save(String),
+    Load(String),
 }
 
 impl BufferMenuState {
@@ -75,7 +77,7 @@ impl Buffer {
             cursor: (0, 0),
             scroll: (0, 0),
             menu: None,
-            saved: false,
+            saved: true,
             path: None,
             hold_blink: Instant::now(),
         }
@@ -156,7 +158,7 @@ impl Buffer {
 
     pub fn read(&mut self) -> bool {
         if let Some(path) = self.path.clone() {
-            fs::read_to_string(path).and_then(|_r|Ok(self.saved=true)).is_ok()
+            fs::read_to_string(path).and_then(|r|{self.body=r;Ok(self.saved=true)}).is_ok()
         } else {
             false
         }
@@ -186,38 +188,58 @@ impl Window for Buffer {
                         Some((0i32, h as i32 -1))
                     },
                     BufferMenuState::Open(message) => {
-                        renderer.put_text(w-1-(message.len() as u32), h-1, message.clone());
-                        renderer.get_mut(0, h-1).c = '>';
-                        // renderer.get_mut(0, h-1).s.fg(BACKGROUND).bg(YELLOW);
-                        Some((1 as i32, h as i32 - 1))
+                        renderer.get_mut(0, h-1).c = '🍵';
+                        renderer.put_text(w - message.len() as u32 -1, h-1, message.clone());
+                        Some((2, h as i32 - 1))
                     }
                     BufferMenuState::Command(cmd) => {
-                        let r = format!(":{}",cmd);
-                        renderer.put_text(0, h-1, r.clone());
-                        // renderer.get_mut(0, h-1).s.fg(BACKGROUND).bg(YELLOW);
-                        Some(((r.len()) as i32, h as i32 - 1))
+                        renderer.get_mut(0, h-1).c = '📜';
+                        renderer.put_text(2, h-1, cmd.clone());
+                        Some(((cmd.len()) as i32+2, h as i32 - 1))
                     }
-                    BufferMenuState::SaveFailed(_id,message) => {
-                        let r = format!("!{}",message);
-                        renderer.put_text(0, h-1, r.clone());
-                        renderer.get_mut(0, h-1).s.fg(BACKGROUND).bg(RED);
-                        Some(((r.len()) as i32, h as i32 - 1))
+                    BufferMenuState::SaveFailed => {
+                        let message = "File not saved, continue?".to_string(); // TODO: Inline below :p
+                        renderer.get_mut(0, h-1).c = '❗';
+                        renderer.put_text(2, h-1, message.clone());
+                        Some(((message.len()) as i32+2, h as i32 - 1))
+                    }
+                    BufferMenuState::Save(path) => {
+                        renderer.get_mut(0, h-1).c = '💾';
+                        renderer.put_text(2, h-1, path.clone());
+                        Some((path.len() as i32+2, h as i32-1))
+                    }
+                    BufferMenuState::Load(path) => {
+                        renderer.get_mut(0, h-1).c = '📂';
+                        renderer.put_text(2, h-1, path.clone());
+                        Some((path.len() as i32+2, h as i32-1))
                     }
                 }
             }
             else {
                 let fmt = format!("{}:{}",cy+1,cx+1);
-                renderer.put_text(w-1-(fmt.len() as u32), h-1, fmt);
+                renderer.put_text(w-1-fmt.len() as u32, h-1, fmt);
+                renderer.get_mut(0, h-1).c = '🪶';
                 None
             }
         ;
 
         // renderer.paint(0, 1, 4, th, Style::default().bg(if cursor.is_none() {COMMENT} else {HEAD}).clone());
         renderer.paint(0, 1, 4, th, Style::default().bg(COMMENT).clone());
+        renderer.paint(4, 1, 1, th, Style::default().fg(HEAD).clone());
 
         {
             renderer.paint(0, 0, w as u32, 1, Style::default().fg(FOREGROUND).bg(HEAD).clone());
-            let path = self.path.clone().unwrap_or("<new>".to_string());
+            let path = self
+                .path.clone()
+                .and_then(|p|
+                    Path::new(&p.clone())
+                        .file_name()
+                        .and_then(|q|
+                            Some(q.to_string_lossy().to_string())
+                        )
+                )
+                .unwrap_or("<new>".to_string())
+            ;
             let off = w/2-(path.len() as u32)/2;
             renderer.put_text(off, 0, path);
             if !self.saved {
@@ -236,7 +258,7 @@ impl Window for Buffer {
         let mut bi = 0;
 
         for y in 0 .. th {
-            renderer.put_text(3, y+1, "~".to_string());
+            renderer.put_text(3, y+1, "~┃".to_string());
         }
 
         for j in 0 .. th {
@@ -316,17 +338,48 @@ impl Window for Buffer {
                                         new_menu = BufferMenuState::Command(String::new());
                                     }
                                     else if c == 'w' {
-                                        if self.write() {
-                                            new_menu = BufferMenuState::Open(format!("Wrote {} bytes",self.body.len()));
+                                        if self.path.is_some() {
+                                            if self.write() {
+                                                new_menu = BufferMenuState::Open(format!("Wrote {} bytes",self.body.len()));
+                                            } else {
+                                                new_menu = BufferMenuState::Open("Could not write".to_string());
+                                            }
                                         } else {
-                                            new_menu = BufferMenuState::Open("Could not write".to_string());
+                                            if let Ok(dir) = current_dir() {
+                                                new_menu = BufferMenuState::Save(format!("{}/",dir.to_str().unwrap()));
+                                            } else {
+                                                new_menu = BufferMenuState::Open("Could not open write menu".to_string());
+                                            }
+                                        }
+                                    }
+                                    else if c == 'r' {
+                                        if self.path.is_some() {
+                                            if self.saved {
+                                                if self.read() {
+                                                    new_menu = BufferMenuState::Open(format!("Read {} bytes",self.body.len()));
+                                                } else {
+                                                    new_menu = BufferMenuState::Open("Could not read".to_string());
+                                                }
+                                            } else {
+                                                new_menu = BufferMenuState::Open("TBD: File not saved".to_string());
+                                            }
+                                        } else {
+                                            if self.saved {
+                                                if let Ok(dir) = current_dir() {
+                                                    new_menu = BufferMenuState::Load(format!("{}/",dir.to_str().unwrap()));
+                                                } else {
+                                                    new_menu = BufferMenuState::Open("Could not open load menu".to_string());
+                                                }
+                                            } else {
+                                                new_menu = BufferMenuState::Open("TBD: File not saved".to_string());
+                                            }
                                         }
                                     }
                                     else if c == 'q' {
                                         if self.saved {
                                             env.running = false;
                                         } else {
-                                            new_menu = BufferMenuState::SaveFailed(0, "File not saved, continue?".to_string());
+                                            new_menu = BufferMenuState::SaveFailed;
                                         }
                                     }
                                 }
@@ -335,22 +388,49 @@ impl Window for Buffer {
                                         cmd.push(c);
                                         new_menu = menu.clone();
                                     }
-                                    else if c == '\n' {
+                                    else if c == '\n' || c == '\r' {
                                         // TODO: Run the action
                                         new_menu = BufferMenuState::None;
                                     }
                                 }
-                                BufferMenuState::SaveFailed(id, _message) => {
-                                    if *id == 0 {
-                                        if c == 'y' || c == 'Y' {
-                                            env.running = false;
-                                        }
-                                        else if c == 'n' || c == 'N' {
-                                            new_menu = BufferMenuState::None;
+                                BufferMenuState::Save(path) => {
+                                    if !c.is_control() {
+                                        path.push(c);
+                                        new_menu = menu.clone();
+                                    }
+                                    else if c == '\n' || c == '\r' {
+                                        let p = self.path.clone();
+                                        self.path = Some(path.clone());
+                                        if self.write() {
+                                            new_menu = BufferMenuState::Open(format!("Wrote {} bytes",self.body.len()));
+                                        } else {
+                                            new_menu = BufferMenuState::Open("Could not write".to_string());
+                                            self.path = p;
                                         }
                                     }
-                                    else {
-                                        panic!("Invalid manu state");
+                                }
+                                BufferMenuState::Load(path) => {
+                                    if !c.is_control() {
+                                        path.push(c);
+                                        new_menu = menu.clone();
+                                    }
+                                    else if c == '\n' {
+                                        let p = self.path.clone();
+                                        self.path = Some(path.clone());
+                                        if self.read() {
+                                            new_menu = BufferMenuState::Open(format!("Read {} bytes",self.body.len()));
+                                        } else {
+                                            new_menu = BufferMenuState::Open("Could not read".to_string());
+                                            self.path = p;
+                                        }
+                                    }
+                                }
+                                BufferMenuState::SaveFailed => {
+                                    if c == 'y' || c == 'Y' {
+                                        env.running = false;
+                                    }
+                                    else if c == 'n' || c == 'N' {
+                                        new_menu = BufferMenuState::None;
                                     }
                                 }
                             }
@@ -360,6 +440,18 @@ impl Window for Buffer {
                                 BufferMenuState::Command(cmd) => {
                                     if cmd.len() > 0 {
                                         cmd.pop();
+                                    }
+                                    new_menu = menu.clone();
+                                }
+                                BufferMenuState::Save(path) => {
+                                    if path.len() > 0 {
+                                        path.pop();
+                                    }
+                                    new_menu = menu.clone();
+                                }
+                                BufferMenuState::Load(path) => {
+                                    if path.len() > 0 {
+                                        path.pop();
                                     }
                                     new_menu = menu.clone();
                                 }
@@ -406,11 +498,9 @@ impl Window for Buffer {
                                 self.saved = false;
                             }
                         }
-                        Key::Ctrl(c) => {
-                            if c == 'c' {
-                                env.running = false;
-                            }
-                        }
+                        /*Key::Ctrl(_c) => {
+                            
+                        }*/
                         Key::Alt(_c) => {
                             // ?
                         }
@@ -540,7 +630,20 @@ fn main() {
     let mut args = args();
 
     let _program = args.next().unwrap();
-    let filename = args.next();
+
+    let filename = args.next()
+        .and_then(|p|
+            if Path::new(&p).is_file() {
+                path::absolute(p)
+                .and_then(|q|
+                    Ok(q.to_string_lossy().to_string())
+                )
+                .ok()
+            } else {
+                None
+            }
+        )
+    ;
 
     /*let mut body = String::new();
 
