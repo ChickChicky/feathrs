@@ -461,6 +461,9 @@ impl Renderer {
                     buff += &cell.s.diff_to_string(style);
                     buff.push(cell.c);
                     style = cell.s;
+                    if !cell.c.is_ascii() {
+                        buff += &format!("\x1b[{}G",x+2);
+                    }
                 }
                 if y < self.buffer.height-1 {
                     buff.push('\n');
@@ -486,6 +489,9 @@ impl Renderer {
                         buff += &cell.s.diff_to_string(style);
                         buff.push(cell.c);
                         style = cell.s;
+                        if !cell.c.is_ascii() {
+                            streak = self.buffer.width;
+                        }
                     }
                 }
             }
