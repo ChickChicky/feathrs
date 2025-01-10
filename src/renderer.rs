@@ -1,10 +1,11 @@
 #![allow(dead_code)]
 
 use std::io::{stdout, Write};
+use serde::{Deserialize, Serialize};
 use terminal_size::{terminal_size,Width,Height};
 use macon::Builder;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
 pub enum Color {
     Unset,
     Black,

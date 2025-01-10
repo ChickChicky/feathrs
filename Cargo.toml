@@ -8,3 +8,5 @@ libc = "0.2.155"
 macon = "1.0.0"
 terminal_size = "0.3.0"
 termion = "4.0.2"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8.19"

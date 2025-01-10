@@ -5,6 +5,7 @@ use std::{collections::VecDeque, env::{args, current_dir}, fs, io::{stdin, stdou
 
 use libc::{self, termios};
 use renderer::{Color, Renderer, Style};
+use serde::{Deserialize, Serialize};
 use termion::{event::{Event, Key}, input::TermReadEventsAndRaw};
 
 mod renderer;
@@ -18,6 +19,34 @@ const RED : Color = Color::RGB(255, 85, 85);
 const YELLOW : Color = Color::RGB(241, 250, 140);
 
 const BLINK_HOLD : Duration = Duration::from_millis(200);
+
+#[derive(Serialize, Deserialize, Debug)]
+struct ColorSettings {
+    background: Color,
+    head: Color,
+    current: Color,
+    foreground: Color,
+    comment: Color,
+    /// black: Color,
+    red: Color,
+    // green: Color,
+    yellow: Color,
+    // blue: Color,
+    // magenta: Color,
+    // cyan: Color,
+    // white: Color,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct ControlSettings {
+    smart_home: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Settings {
+    color: ColorSettings,
+    controls: ControlSettings,
+}
 
 struct Clock {
     next: Instant,
@@ -53,7 +82,9 @@ enum BufferMenuState {
     Command(String),
     SaveFailed,
     Save(String),
+    Overwrite(String),
     Load(String),
+    ForceLoad,
 }
 
 impl BufferMenuState {
@@ -150,7 +181,11 @@ impl Buffer {
 
     pub fn write(&mut self) -> bool {
         if let Some(path) = self.path.clone() {
-            fs::write(path, self.body.clone()).and_then(|_r|Ok(self.saved=true)).is_ok()
+            fs::write(path, self.body.clone())
+                .and_then(
+                    |_r| Ok(self.saved=true)
+                )
+                .is_ok()
         } else {
             false
         }
@@ -158,11 +193,26 @@ impl Buffer {
 
     pub fn read(&mut self) -> bool {
         if let Some(path) = self.path.clone() {
-            fs::read_to_string(path).and_then(|r|{self.body=r;Ok(self.saved=true)}).is_ok()
+            fs::read_to_string(path)
+                .and_then(
+                    |r| {
+                        self.body=r;
+                        Ok(self.saved=true)
+                    }
+                )
+                .is_ok()
         } else {
             false
         }
     }
+}
+
+fn leading_whitespaces(str: &str) -> usize {
+    str
+        .chars()
+        .take_while(|char| char.is_whitespace())
+        .map(|char| char.len_utf8())
+        .sum()
 }
 
 impl Window for Buffer {
@@ -171,6 +221,14 @@ impl Window for Buffer {
 
         let w = renderer.buffer.width;
         let h = renderer.buffer.height;
+
+        if w < 10 || h < 3 {
+            renderer.fill(0, 0, w, h, renderer::Cell { c: '!', s: Style::default() });
+            renderer.render();
+            renderer.flip();
+            stdout().flush().unwrap();
+            return;
+        }
 
         let tw = w - 5u32;
         let th = h - 2u32;
@@ -198,7 +256,7 @@ impl Window for Buffer {
                         Some(((cmd.len()) as i32+2, h as i32 - 1))
                     }
                     BufferMenuState::SaveFailed => {
-                        let message = "File not saved, continue?".to_string(); // TODO: Inline below :p
+                        let message = "Abandon unsaved? ".to_string(); // TODO: Inline below :p
                         renderer.get_mut(0, h-1).c = '❗';
                         renderer.put_text(2, h-1, message.clone());
                         Some(((message.len()) as i32+2, h as i32 - 1))
@@ -208,10 +266,22 @@ impl Window for Buffer {
                         renderer.put_text(2, h-1, path.clone());
                         Some((path.len() as i32+2, h as i32-1))
                     }
+                    BufferMenuState::Overwrite(_path) => {
+                        let message = "Overwrite? ".to_string();
+                        renderer.get_mut(0, h-1).c = '💾';
+                        renderer.put_text(2, h-1, message.clone());
+                        Some((message.len() as i32+2, h as i32-1))
+                    }
                     BufferMenuState::Load(path) => {
                         renderer.get_mut(0, h-1).c = '📂';
                         renderer.put_text(2, h-1, path.clone());
                         Some((path.len() as i32+2, h as i32-1))
+                    }
+                    BufferMenuState::ForceLoad => {
+                        let message = "Abandon unsaved? ".to_string();
+                        renderer.get_mut(0, h-1).c = '📂';
+                        renderer.put_text(2, h-1, message.clone());
+                        Some((message.len() as i32+2, h as i32-1))
                     }
                 }
             }
@@ -361,7 +431,7 @@ impl Window for Buffer {
                                                     new_menu = BufferMenuState::Open("Could not read".to_string());
                                                 }
                                             } else {
-                                                new_menu = BufferMenuState::Open("TBD: File not saved".to_string());
+                                                new_menu = BufferMenuState::ForceLoad;
                                             }
                                         } else {
                                             if self.saved {
@@ -371,7 +441,7 @@ impl Window for Buffer {
                                                     new_menu = BufferMenuState::Open("Could not open load menu".to_string());
                                                 }
                                             } else {
-                                                new_menu = BufferMenuState::Open("TBD: File not saved".to_string());
+                                                new_menu = BufferMenuState::ForceLoad;
                                             }
                                         }
                                     }
@@ -381,6 +451,27 @@ impl Window for Buffer {
                                         } else {
                                             new_menu = BufferMenuState::SaveFailed;
                                         }
+                                    }
+                                }
+                                BufferMenuState::ForceLoad => {
+                                    if c == 'y' || c == 'Y' {
+                                        if self.path.is_some() {
+                                            if self.read() {
+                                                new_menu = BufferMenuState::Open(format!("Read {} bytes",self.body.len()));
+                                            } else {
+                                                new_menu = BufferMenuState::Open("Could not read".to_string());
+                                            }
+                                        }
+                                        else {
+                                            if let Ok(dir) = current_dir() {
+                                                new_menu = BufferMenuState::Load(format!("{}/",dir.to_str().unwrap()));
+                                            } else {
+                                                new_menu = BufferMenuState::Open("Could not open load menu".to_string());
+                                            }
+                                        }
+                                    }
+                                    if c == 'n' || c == 'N' {
+                                        new_menu = BufferMenuState::Open(String::new());
                                     }
                                 }
                                 BufferMenuState::Command(cmd) => {
@@ -400,6 +491,22 @@ impl Window for Buffer {
                                     }
                                     else if c == '\n' || c == '\r' {
                                         let p = self.path.clone();
+                                        if self.path.clone().unwrap_or("".to_string()) != path.clone() {
+                                            new_menu = BufferMenuState::Overwrite(path.clone());
+                                        } else {
+                                            self.path = Some(path.clone());
+                                            if self.write() {
+                                                new_menu = BufferMenuState::Open(format!("Wrote {} bytes",self.body.len()));
+                                            } else {
+                                                new_menu = BufferMenuState::Open("Could not write".to_string());
+                                                self.path = p;
+                                            }
+                                        }
+                                    }
+                                }
+                                BufferMenuState::Overwrite(path) => {
+                                    if c == 'y' || c == 'Y' {
+                                        let p = self.path.clone();
                                         self.path = Some(path.clone());
                                         if self.write() {
                                             new_menu = BufferMenuState::Open(format!("Wrote {} bytes",self.body.len()));
@@ -407,6 +514,9 @@ impl Window for Buffer {
                                             new_menu = BufferMenuState::Open("Could not write".to_string());
                                             self.path = p;
                                         }
+                                    }
+                                    if c == 'n' || c == 'N' {
+                                        new_menu = BufferMenuState::Open(String::new());
                                     }
                                 }
                                 BufferMenuState::Load(path) => {
@@ -430,7 +540,7 @@ impl Window for Buffer {
                                         env.running = false;
                                     }
                                     else if c == 'n' || c == 'N' {
-                                        new_menu = BufferMenuState::None;
+                                        new_menu = BufferMenuState::Open(String::new());
                                     }
                                 }
                             }
@@ -474,7 +584,7 @@ impl Window for Buffer {
                     let mut blink = false;
                     match key {
                         Key::Esc => {
-                            self.menu = Some(BufferMenuState::Open("".to_string()));
+                            self.menu = Some(BufferMenuState::Open(String::new()));
                         }
                         Key::Char(c) => {
                             let ci = self.cur(self.fix(self.cursor));
@@ -552,7 +662,14 @@ impl Window for Buffer {
                             self.cursor.0 = self.body.split('\n').nth(self.cursor.1 as usize).unwrap().len() as i32;
                         }
                         Key::Home => {
-                            self.cursor.0 = 0;
+                            if env.settings.controls.smart_home {
+                                let line = self.body.split('\n').nth(self.cursor.1 as usize).unwrap();
+                                let i = leading_whitespaces(line) as i32;
+
+                                self.cursor.0 = if self.cursor.0 == i { 0 } else { i };
+                            } else {
+                                self.cursor.0 = 0;
+                            }
                         }
                         _ => {
                             let ci = self.cur(self.fix(self.cursor));
@@ -600,6 +717,7 @@ impl Windows {
 struct Env {
     windows: Windows,
     running: bool,
+    settings: Settings,
 }
 
 fn raw_stdin() -> termios {
@@ -662,7 +780,32 @@ fn main() {
     let mut env = Env{
         windows: Windows::new(),
         running: true,
+        settings: Settings{
+            color: ColorSettings{
+                background: Color::RGB(40, 42, 54),
+                head: Color::RGB(68, 71, 90),
+                current: Color::RGB(50, 52, 64),
+                foreground: Color::RGB(248, 248, 242),
+                comment: Color::RGB(98, 114, 164),
+                red: Color::RGB(255, 85, 85),
+                yellow: Color::RGB(241, 250, 140),
+            },
+            controls: ControlSettings{
+                smart_home: true,
+            },
+        }
     };
+
+    let mut dst = "".to_string();
+    let mut ser = toml::Serializer::new(&mut dst);
+    if let Err(err) = env.settings.serialize(ser) {
+        eprintln!("{}",err);
+        panic!();
+    }
+    if let Err(err) = fs::write("./settings.toml".to_string(), dst) {
+        eprintln!("{}",err);
+        panic!();
+    }
 
     env.windows.push(
         Box::new(
